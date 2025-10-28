@@ -1,33 +1,58 @@
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 from typing import List, Optional
 import motor.motor_asyncio  # Import the async MongoDB driver
 import datetime              # To timestamp our logs
 import os                    # To handle environment variables
+from contextlib import asynccontextmanager
 
 # --- Configuration ---
 # Load the MONGO_URI from Vercel's Environment Variables
 MONGO_URI = os.getenv("MONGO_URI")
 
-# --- Database Connection ---
-client = None
-db = None
-log_collection = None
+# --- Database Connection Lifespan ---
 
-if not MONGO_URI:
-    print("FATAL ERROR: MONGO_URI environment variable is not set.")
-else:
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Manages the MongoDB connection lifespan.
+    The connection is established on startup and closed on shutdown.
+    """
+    if not MONGO_URI:
+        print("FATAL ERROR: MONGO_URI environment variable is not set.")
+        app.state.client = None
+        app.state.db = None
+        app.state.log_collection = None
+        yield
+        # No connection to close
+        return
+        
+    print("Connecting to MongoDB...")
     try:
-        client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
-        db = client.event  # Your database is named 'event'
-        log_collection = db.rag_logs  # Collection named 'rag_logs'
-        print("Attempting to connect to MongoDB...")
-        # We will verify the connection in the health check
+        # Create the client instance and store it in app.state
+        app.state.client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
+        app.state.db = app.state.client.event
+        app.state.log_collection = app.state.db.rag_logs
+        
+        # Test the connection with a ping
+        await app.state.client.admin.command('ping')
+        print("Successfully connected to MongoDB.")
+        
     except Exception as e:
-        print(f"ERROR: Could not initialize MongoDB client: {e}")
-        client = None
-        log_collection = None
+        print(f"FATAL: Could not connect to MongoDB on startup: {e}")
+        app.state.client = None
+        app.state.db = None
+        app.state.log_collection = None
+
+    # --- Application is now running ---
+    yield
+    # --- Application is shutting down ---
+    
+    if app.state.client:
+        print("Closing MongoDB connection...")
+        app.state.client.close()
+
 
 # --- Pydantic Models ---
 class QueryRequest(BaseModel):
@@ -42,26 +67,27 @@ class QueryResponse(BaseModel):
 app = FastAPI(
     title="RAG Medical Query API",
     description="An API to get answers and contexts for medical questions.",
-    version="0.1.0"
+    version="0.1.0",
+    lifespan=lifespan  # <-- This is the crucial part
 )
 
 # --- Endpoints ---
 
 @app.get("/", include_in_schema=False)
-async def health_check():
+async def health_check(request: Request):
     """
     Simple health check to verify database connection.
-    Visit this endpoint (/) in your browser.
+    It accesses the client from the app's state.
     """
-    if client is None or log_collection is None:
+    if request.app.state.client is None:
         raise HTTPException(
             status_code=503,
             detail="Mongo client not initialized. Check MONGO_URI env var."
         )
     
     try:
-        # 'ping' is a lightweight command to check auth and connection
-        await client.admin.command('ping')
+        # Ping again to be sure
+        await request.app.state.client.admin.command('ping')
         return {"status": "ok", "message": "Successfully connected to MongoDB."}
     except Exception as e:
         print(f"Health check failed: {e}")
@@ -71,18 +97,18 @@ async def health_check():
         )
 
 @app.post("/query", response_model=QueryResponse)
-async def get_rag_response(request: QueryRequest):
+async def get_rag_response(query_request: QueryRequest, request: Request):
     """
     Accepts a medical query and returns a generated answer along with
     the context snippets used to generate that answer.
-
-    All requests, responses, and errors are logged to MongoDB.
     """
-    print(f"Received query: '{request.query}' with top_k={request.top_k}")
+    # Get the log_collection from the application state
+    log_collection = request.app.state.log_collection
+
+    print(f"Received query: '{query_request.query}' with top_k={query_request.top_k}")
 
     if log_collection is None:
         print("Warning: MongoDB not connected. Skipping logging.")
-        # Raise an error immediately so the user knows the service is down
         raise HTTPException(
             status_code=503,
             detail="Service unavailable: Cannot connect to log database."
@@ -93,11 +119,11 @@ async def get_rag_response(request: QueryRequest):
         # TODO: Replace this placeholder logic with your actual RAG model call
 
         placeholder_contexts = [
-            f"Placeholder context 1 for query: '{request.query}'",
-            f"Placeholder context 2 (top_k was {request.top_k})",
+            f"Placeholder context 1 for query: '{query_request.query}'",
+            f"Placeholder context 2 (top_k was {query_request.top_k})",
             "Placeholder context 3: Always consult a medical professional."
         ]
-        placeholder_answer = f"This is a placeholder answer for '{request.query}'. The RAG model is not yet integrated."
+        placeholder_answer = f"This is a placeholder answer for '{query_request.query}'. The RAG model is not yet integrated."
 
         response = QueryResponse(
             answer=placeholder_answer,
@@ -107,8 +133,8 @@ async def get_rag_response(request: QueryRequest):
         # --- Log Successful Response ---
         log_entry = {
             "timestamp": datetime.datetime.now(datetime.timezone.utc),
-            "request_query": request.query,
-            "request_top_k": request.top_k,
+            "request_query": query_request.query,
+            "request_top_k": query_request.top_k,
             "response_answer": response.answer,
             "response_contexts": response.contexts,
             "status": "success"
@@ -120,22 +146,15 @@ async def get_rag_response(request: QueryRequest):
         return response
 
     except Exception as e:
-        # --- FIXED ERROR HANDLING ---
-        # We DO NOT try to log to MongoDB here, as that might be the 
-        # very thing that failed. We print to Vercel logs instead.
-        
         print(f"CRITICAL ERROR processing request: {e}")
-
-        # Log the error details to the Vercel console
         error_log_data = {
-            "request_query": request.query,
-            "request_top_k": request.top_k,
+            "request_query": query_request.query,
+            "request_top_k": query_request.top_k,
             "error_message": str(e),
             "status": "error"
         }
         print(f"Failed to process request. Error data: {error_log_data}")
 
-        # Raise the HTTP Exception
         raise HTTPException(
             status_code=500,
             detail=f"An internal server error occurred. Check logs. Error: {str(e)}"
@@ -143,14 +162,6 @@ async def get_rag_response(request: QueryRequest):
 
 # --- To Run This Server Locally ---
 if __name__ == "__main__":
-    # This block allows you to run the app directly with "python main.py"
-    # Uvicorn is the server that runs the app
-    
-    # For local running, you MUST set the env var in your terminal first:
-    # export MONGO_URI="your_full_mongo_uri_string_here"
-    # Or on Windows:
-    # set MONGO_URI="your_full_mongo_uri_string_here"
-    
     print("--- Starting local server ---")
     if not MONGO_URI:
         print("WARNING: MONGO_URI is not set. Database will not connect.")
