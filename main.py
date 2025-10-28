@@ -1,6 +1,8 @@
 import os
 import datetime
 import traceback
+import logging
+import sys
 from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException, Request
@@ -10,15 +12,23 @@ from pydantic import BaseModel, Field
 import motor.motor_asyncio
 import uvicorn
 
+# --- Logging Configuration ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger(__name__)
+
 # --- Configuration ---
 MONGO_URI = os.getenv("MONGO_URI")
 
 def get_mongo_client():
     """
     Create a NEW MongoDB client for each request.
-    DO NOT cache Motor clients in serverless - they get attached to closed event loops.
     """
-    print("🔄 Creating fresh MongoDB client for this request...")
+    logger.info("🔄 Creating fresh MongoDB client for this request...")
     client = motor.motor_asyncio.AsyncIOMotorClient(
         MONGO_URI,
         serverSelectionTimeoutMS=5000,
@@ -27,7 +37,7 @@ def get_mongo_client():
         maxPoolSize=1,
         minPoolSize=0
     )
-    print("✅ MongoDB client created")
+    logger.info("✅ MongoDB client created")
     return client
 
 # --- Pydantic Models ---
@@ -61,10 +71,8 @@ async def global_exception_handler(request: Request, exc: Exception):
         "method": request.method
     }
     
-    print(f"❌ UNHANDLED EXCEPTION:")
-    print(f"   Type: {type(exc).__name__}")
-    print(f"   Message: {str(exc)}")
-    print(f"   Traceback:\n{traceback.format_exc()}")
+    logger.error(f"❌ UNHANDLED EXCEPTION: {type(exc).__name__}: {str(exc)}")
+    logger.error(f"Traceback:\n{traceback.format_exc()}")
     
     return JSONResponse(
         status_code=500,
@@ -84,7 +92,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         "body": exc.body if hasattr(exc, 'body') else None
     }
     
-    print(f"❌ VALIDATION ERROR: {exc.errors()}")
+    logger.warning(f"❌ VALIDATION ERROR: {exc.errors()}")
     
     return JSONResponse(
         status_code=422,
@@ -108,12 +116,12 @@ async def health_check():
     if not MONGO_URI:
         diagnostics["status"] = "error"
         diagnostics["error"] = "MONGO_URI not set"
-        print(f"❌ Health check failed: MONGO_URI not set")
+        logger.error("❌ Health check failed: MONGO_URI not set")
         return JSONResponse(status_code=503, content=diagnostics)
     
     client = None
     try:
-        print("🏥 Running health check...")
+        logger.info("🏥 Running health check...")
         client = get_mongo_client()
         
         # Try to ping MongoDB
@@ -121,7 +129,7 @@ async def health_check():
         
         diagnostics["status"] = "ok"
         diagnostics["message"] = "MongoDB connection successful"
-        print(f"✅ Health check passed")
+        logger.info("✅ Health check passed")
         return JSONResponse(status_code=200, content=diagnostics)
         
     except Exception as e:
@@ -129,22 +137,21 @@ async def health_check():
         diagnostics["error"] = str(e)
         diagnostics["error_type"] = type(e).__name__
         diagnostics["traceback"] = traceback.format_exc()
-        print(f"❌ Health check failed: {str(e)}")
-        print(traceback.format_exc())
+        logger.error(f"❌ Health check failed: {str(e)}")
+        logger.debug(traceback.format_exc())
         return JSONResponse(status_code=503, content=diagnostics)
     
     finally:
-        # CRITICAL: Close the client after each request in serverless
         if client:
             client.close()
-            print("🔒 MongoDB client closed")
+            logger.debug("🔒 MongoDB client closed")
 
 @app.post("/query")
 async def get_rag_response(query_request: QueryRequest):
     """
     Accepts a medical query and returns a generated answer with logging.
     """
-    print(f"📝 Received query: '{query_request.query}' with top_k={query_request.top_k}")
+    logger.info(f"📝 Received query: '{query_request.query}' with top_k={query_request.top_k}")
 
     if not MONGO_URI:
         return JSONResponse(
@@ -162,7 +169,7 @@ async def get_rag_response(query_request: QueryRequest):
         db = client.event
         log_collection = db.rag_logs
         
-        print("🔍 Processing query...")
+        logger.info("🔍 Processing query...")
         
         # --- RAG Model Integration ---
         placeholder_contexts = [
@@ -185,18 +192,18 @@ async def get_rag_response(query_request: QueryRequest):
             "response_contexts": response["contexts"],
             "status": "success"
         }
-        print("💾 Storing log to MongoDB...")
+        logger.info("💾 Storing log to MongoDB...")
         
         await log_collection.insert_one(log_entry)
-        print("✅ Log stored successfully")
+        logger.info("✅ Log stored successfully")
 
         return JSONResponse(status_code=200, content=response)
 
     except Exception as e:
         error_msg = f"ERROR processing request: {str(e)}"
         error_trace = traceback.format_exc()
-        print(f"❌ {error_msg}")
-        print(f"   Traceback:\n{error_trace}")
+        logger.error(f"❌ {error_msg}")
+        logger.debug(f"Traceback:\n{error_trace}")
         
         # Try to log error
         try:
@@ -214,9 +221,9 @@ async def get_rag_response(query_request: QueryRequest):
                     "status": "error"
                 }
                 await log_collection.insert_one(error_log_data)
-                print("💾 Error logged to database")
+                logger.info("💾 Error logged to database")
         except Exception as log_e:
-            print(f"❌ Failed to log error: {str(log_e)}")
+            logger.error(f"❌ Failed to log error: {str(log_e)}")
 
         return JSONResponse(
             status_code=500,
@@ -229,10 +236,9 @@ async def get_rag_response(query_request: QueryRequest):
         )
     
     finally:
-        # CRITICAL: Always close client in serverless
         if client:
             client.close()
-            print("🔒 MongoDB client closed")
+            logger.debug("🔒 MongoDB client closed")
 
 # --- Debug endpoint ---
 @app.get("/debug/env")
@@ -240,6 +246,7 @@ async def debug_environment():
     """
     Debug endpoint
     """
+    logger.info("Debug endpoint accessed")
     return {
         "mongo_uri_set": bool(MONGO_URI),
         "mongo_uri_length": len(MONGO_URI) if MONGO_URI else 0,
@@ -249,8 +256,8 @@ async def debug_environment():
 
 # --- Local Development ---
 if __name__ == "__main__":
-    print("--- Starting local server ---")
+    logger.info("--- Starting local server ---")
     if not MONGO_URI:
-        print("⚠️ WARNING: MONGO_URI is not set")
+        logger.warning("⚠️ WARNING: MONGO_URI is not set")
     
     uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
