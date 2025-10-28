@@ -30,8 +30,9 @@ async def lifespan(app: FastAPI):
         
     print("Connecting to MongoDB...")
     try:
-        # Create the client instance and store it in app.state
+        # --- THIS IS THE CORRECTED LINE ---
         app.state.client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
+        
         app.state.db = app.state.client.event
         app.state.log_collection = app.state.db.rag_logs
         
@@ -68,7 +69,7 @@ app = FastAPI(
     title="RAG Medical Query API",
     description="An API to get answers and contexts for medical questions.",
     version="0.1.0",
-    lifespan=lifespan  # <-- This is the crucial part
+    lifespan=lifespan  # Manages startup/shutdown
 )
 
 # --- Endpoints ---
@@ -82,7 +83,7 @@ async def health_check(request: Request):
     if request.app.state.client is None:
         raise HTTPException(
             status_code=503,
-            detail="Mongo client not initialized. Check MONGO_URI env var."
+            detail="Mongo client not initialized. Check MONGO_URI env var or startup logs."
         )
     
     try:
@@ -166,4 +167,4 @@ if __name__ == "__main__":
     if not MONGO_URI:
         print("WARNING: MONGO_URI is not set. Database will not connect.")
     
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
