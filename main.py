@@ -2,21 +2,21 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 from typing import List, Optional
-import motor.motor_asyncio  # Import the async MongoDB driver
-import datetime              # To timestamp our logs
-import os                    # To handle environment variables
+import pymongo  # <-- IMPORT PYMONGO, NOT MOTOR
+import datetime
+import os
 from contextlib import asynccontextmanager
 
 # --- Configuration ---
 MONGO_URI = os.getenv("MONGO_URI")
 
 # --- Database Connection Lifespan ---
+# We still use lifespan to create the client, but it's now a SYNC client.
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
     Manages the MongoDB connection lifespan.
-    It NOW ONLY CREATES THE CLIENT, IT DOES NOT PING.
     """
     if not MONGO_URI:
         print("FATAL ERROR: MONGO_URI environment variable is not set.")
@@ -26,17 +26,22 @@ async def lifespan(app: FastAPI):
         yield
         return
         
-    print("Initializing MongoDB client...")
+    print("Initializing MongoDB SYNC client...")
     try:
-        # We ONLY create the client instance. We do NOT ping.
-        # This will allow the app to start even if the DB is unreachable.
-        app.state.client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
+        # --- THIS IS THE BIG CHANGE ---
+        # We are using the standard, synchronous Pymongo client
+        app.state.client = pymongo.MongoClient(MONGO_URI)
+        
+        # Ping on startup to confirm connection.
+        # This will raise an error if it fails, which is what we want.
+        app.state.client.admin.command('ping')
+        
         app.state.db = app.state.client.event
         app.state.log_collection = app.state.db.rag_logs
-        print("MongoDB client initialized.")
+        print("MongoDB SYNC client initialized and ping successful.")
         
     except Exception as e:
-        print(f"FATAL: Could not initialize MongoDB client: {e}")
+        print(f"FATAL: Could not connect to MongoDB on startup: {e}")
         app.state.client = None
         app.state.db = None
         app.state.log_collection = None
@@ -48,7 +53,6 @@ async def lifespan(app: FastAPI):
     if app.state.client:
         print("Closing MongoDB connection...")
         app.state.client.close()
-
 
 # --- Pydantic Models ---
 class QueryRequest(BaseModel):
@@ -70,33 +74,21 @@ app = FastAPI(
 # --- Endpoints ---
 
 @app.get("/", include_in_schema=False)
-async def health_check(request: Request):
+def health_check(request: Request):  # <-- Note: no async
     """
-    Simple health check to verify database connection.
-    This will now be the FIRST place that actually tries to connect.
+    Simple health check.
     """
     if request.app.state.client is None:
         raise HTTPException(
             status_code=503,
-            detail="Mongo client not initialized. Check MONGO_URI env var or startup logs."
+            detail="Mongo client not initialized. Check startup logs."
         )
     
-    try:
-        # The ping is now HERE.
-        print("Health check: Pinging MongoDB...")
-        await request.app.state.client.admin.command('ping')
-        print("Health check: Ping successful.")
-        return {"status": "ok", "message": "Successfully connected to MongoDB."}
-    except Exception as e:
-        # If the ping fails, we will now SEE THE ERROR.
-        print(f"Health check FAILED: {e}")
-        raise HTTPException(
-            status_code=503,
-            detail=f"Could not connect to MongoDB. Error: {e}"
-        )
+    # We don't need to ping again, startup already did.
+    return {"status": "ok", "message": "Successfully connected to MongoDB (sync client)."}
 
 @app.post("/query", response_model=QueryResponse)
-async def get_rag_response(query_request: QueryRequest, request: Request):
+def get_rag_response(query_request: QueryRequest, request: Request): # <-- Note: no async
     """
     Accepts a medical query and returns a generated answer.
     """
@@ -112,22 +104,18 @@ async def get_rag_response(query_request: QueryRequest, request: Request):
 
     try:
         # --- RAG Model Integration ---
-        # TODO: Replace this placeholder logic with your actual RAG model call
-
         placeholder_contexts = [
             f"Placeholder context 1 for query: '{query_request.query}'",
             f"Placeholder context 2 (top_k was {query_request.top_k})",
-            "Placeholder context 3: Always consult a medical professional."
         ]
-
-        placeholder_answer = f"This is a placeholder answer for '{query_request.query}'. The RAG model is not yet integrated."
+        placeholder_answer = f"This is a placeholder answer for '{query_request.query}'."
 
         response = QueryResponse(
             answer=placeholder_answer,
             contexts=placeholder_contexts
         )
 
-        # --- Log Successful Response ---
+        # --- Log Successful Response (SYNC) ---
         log_entry = {
             "timestamp": datetime.datetime.now(datetime.timezone.utc),
             "request_query": query_request.query,
@@ -136,21 +124,27 @@ async def get_rag_response(query_request: QueryRequest, request: Request):
             "response_contexts": response.contexts,
             "status": "success"
         }
-        print("Storing successful request log to MongoDB...")
-        await log_collection.insert_one(log_entry)
+        print("Storing successful request log to MongoDB (sync)...")
+        # --- NO AWAIT ---
+        log_collection.insert_one(log_entry)
         print("...Log stored successfully.")
 
         return response
 
     except Exception as e:
         print(f"CRITICAL ERROR processing request: {e}")
-        error_log_data = {
-            "request_query": query_request.query,
-            "request_top_k": query_request.top_k,
-            "error_message": str(e),
-            "status": "error"
-        }
-        print(f"Failed to process request. Error data: {error_log_data}")
+        # --- Log Error (SYNC) ---
+        try:
+            error_log_data = {
+                "timestamp": datetime.datetime.now(datetime.timezone.utc),
+                "request_query": query_request.query,
+                "request_top_k": query_request.top_k,
+                "error_message": str(e),
+                "status": "error"
+            }
+            log_collection.insert_one(error_log_data)
+        except Exception as log_e:
+            print(f"Failed to even log the error: {log_e}")
 
         raise HTTPException(
             status_code=500,
