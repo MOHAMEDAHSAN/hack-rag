@@ -111,10 +111,21 @@ async def get_rag_response(query_request: QueryRequest, request: Request):
         )
 
     try:
-        # ... (Placeholder logic remains the same) ...
-        placeholder_contexts = [f"Context for '{query_request.query}'"]
-        placeholder_answer = f"Answer for '{query_request.query}'"
-        response = QueryResponse(answer=placeholder_answer, contexts=placeholder_contexts)
+        # --- RAG Model Integration ---
+        # TODO: Replace this placeholder logic with your actual RAG model call
+
+        placeholder_contexts = [
+            f"Placeholder context 1 for query: '{query_request.query}'",
+            f"Placeholder context 2 (top_k was {query_request.top_k})",
+            "Placeholder context 3: Always consult a medical professional."
+        ]
+
+        placeholder_answer = f"This is a placeholder answer for '{query_request.query}'. The RAG model is not yet integrated."
+
+        response = QueryResponse(
+            answer=placeholder_answer,
+            contexts=placeholder_contexts
+        )
 
         # --- Log Successful Response ---
         log_entry = {
