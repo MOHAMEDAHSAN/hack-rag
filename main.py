@@ -8,7 +8,6 @@ import os                    # To handle environment variables
 from contextlib import asynccontextmanager
 
 # --- Configuration ---
-# Load the MONGO_URI from Vercel's Environment Variables
 MONGO_URI = os.getenv("MONGO_URI")
 
 # --- Database Connection Lifespan ---
@@ -17,7 +16,7 @@ MONGO_URI = os.getenv("MONGO_URI")
 async def lifespan(app: FastAPI):
     """
     Manages the MongoDB connection lifespan.
-    The connection is established on startup and closed on shutdown.
+    It NOW ONLY CREATES THE CLIENT, IT DOES NOT PING.
     """
     if not MONGO_URI:
         print("FATAL ERROR: MONGO_URI environment variable is not set.")
@@ -25,23 +24,19 @@ async def lifespan(app: FastAPI):
         app.state.db = None
         app.state.log_collection = None
         yield
-        # No connection to close
         return
         
-    print("Connecting to MongoDB...")
+    print("Initializing MongoDB client...")
     try:
-        # --- THIS IS THE CORRECTED LINE ---
+        # We ONLY create the client instance. We do NOT ping.
+        # This will allow the app to start even if the DB is unreachable.
         app.state.client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
-        
         app.state.db = app.state.client.event
         app.state.log_collection = app.state.db.rag_logs
-        
-        # Test the connection with a ping
-        await app.state.client.admin.command('ping')
-        print("Successfully connected to MongoDB.")
+        print("MongoDB client initialized.")
         
     except Exception as e:
-        print(f"FATAL: Could not connect to MongoDB on startup: {e}")
+        print(f"FATAL: Could not initialize MongoDB client: {e}")
         app.state.client = None
         app.state.db = None
         app.state.log_collection = None
@@ -78,7 +73,7 @@ app = FastAPI(
 async def health_check(request: Request):
     """
     Simple health check to verify database connection.
-    It accesses the client from the app's state.
+    This will now be the FIRST place that actually tries to connect.
     """
     if request.app.state.client is None:
         raise HTTPException(
@@ -87,25 +82,25 @@ async def health_check(request: Request):
         )
     
     try:
-        # Ping again to be sure
+        # The ping is now HERE.
+        print("Health check: Pinging MongoDB...")
         await request.app.state.client.admin.command('ping')
+        print("Health check: Ping successful.")
         return {"status": "ok", "message": "Successfully connected to MongoDB."}
     except Exception as e:
-        print(f"Health check failed: {e}")
+        # If the ping fails, we will now SEE THE ERROR.
+        print(f"Health check FAILED: {e}")
         raise HTTPException(
             status_code=503,
-            detail=f"Could not connect to MongoDB: {e}"
+            detail=f"Could not connect to MongoDB. Error: {e}"
         )
 
 @app.post("/query", response_model=QueryResponse)
 async def get_rag_response(query_request: QueryRequest, request: Request):
     """
-    Accepts a medical query and returns a generated answer along with
-    the context snippets used to generate that answer.
+    Accepts a medical query and returns a generated answer.
     """
-    # Get the log_collection from the application state
     log_collection = request.app.state.log_collection
-
     print(f"Received query: '{query_request.query}' with top_k={query_request.top_k}")
 
     if log_collection is None:
@@ -116,20 +111,10 @@ async def get_rag_response(query_request: QueryRequest, request: Request):
         )
 
     try:
-        # --- RAG Model Integration ---
-        # TODO: Replace this placeholder logic with your actual RAG model call
-
-        placeholder_contexts = [
-            f"Placeholder context 1 for query: '{query_request.query}'",
-            f"Placeholder context 2 (top_k was {query_request.top_k})",
-            "Placeholder context 3: Always consult a medical professional."
-        ]
-        placeholder_answer = f"This is a placeholder answer for '{query_request.query}'. The RAG model is not yet integrated."
-
-        response = QueryResponse(
-            answer=placeholder_answer,
-            contexts=placeholder_contexts
-        )
+        # ... (Placeholder logic remains the same) ...
+        placeholder_contexts = [f"Context for '{query_request.query}'"]
+        placeholder_answer = f"Answer for '{query_request.query}'"
+        response = QueryResponse(answer=placeholder_answer, contexts=placeholder_contexts)
 
         # --- Log Successful Response ---
         log_entry = {
